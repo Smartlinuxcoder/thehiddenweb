@@ -1,8 +1,5 @@
 package main
 
-// An example Bubble Tea server. This will put an ssh session into alt screen
-// and continually print up to date terminal information.
-
 import (
 	"context"
 	"errors"
@@ -10,9 +7,12 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 
+	"github.com/charmbracelet/bubbles/textarea"
+	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/log"
@@ -24,9 +24,27 @@ import (
 )
 
 const (
-	host = "localhost"
-	port = "23234"
+	host            = "localhost"
+	port            = "23234"
+	refreshInterval = 1 * time.Second
 )
+
+var (
+	chatMessages = make([]string, 0)
+	chatMutex    = &sync.RWMutex{}
+)
+
+func addMessage(message string) {
+	chatMutex.Lock()
+	defer chatMutex.Unlock()
+	chatMessages = append(chatMessages, message)
+}
+
+func getMessages() []string {
+	chatMutex.RLock()
+	defer chatMutex.RUnlock()
+	return append([]string(nil), chatMessages...)
+}
 
 func main() {
 	s, err := wish.NewServer(
@@ -34,17 +52,21 @@ func main() {
 		wish.WithHostKeyPath(".ssh/id_ed25519"),
 		wish.WithMiddleware(
 			bubbletea.Middleware(teaHandler),
-			activeterm.Middleware(), // Bubble Tea apps usually require a PTY.
+			activeterm.Middleware(),
 			logging.Middleware(),
 		),
 	)
 	if err != nil {
 		log.Error("Could not start server", "error", err)
+		return
 	}
+
+	addMessage("Welcome to the SSH Chat Room!")
 
 	done := make(chan os.Signal, 1)
 	signal.Notify(done, os.Interrupt, syscall.SIGINT, syscall.SIGTERM)
-	log.Info("Starting SSH server", "host", host, "port", port)
+	log.Info("Starting SSH chat server", "host", host, "port", port)
+
 	go func() {
 		if err = s.ListenAndServe(); err != nil && !errors.Is(err, ssh.ErrServerClosed) {
 			log.Error("Could not start server", "error", err)
@@ -61,74 +83,146 @@ func main() {
 	}
 }
 
-// You can wire any Bubble Tea model up to the middleware with a function that
-// handles the incoming ssh.Session. Here we just grab the terminal info and
-// pass it to the new model. You can also return tea.ProgramOptions (such as
-// tea.WithAltScreen) on a session by session basis.
 func teaHandler(s ssh.Session) (tea.Model, []tea.ProgramOption) {
-	// This should never fail, as we are using the activeterm middleware.
 	pty, _, _ := s.Pty()
 
-	// When running a Bubble Tea app over SSH, you shouldn't use the default
-	// lipgloss.NewStyle function.
-	// That function will use the color profile from the os.Stdin, which is the
-	// server, not the client.
-	// We provide a MakeRenderer function in the bubbletea middleware package,
-	// so you can easily get the correct renderer for the current session, and
-	// use it to create the styles.
-	// The recommended way to use these styles is to then pass them down to
-	// your Bubble Tea model.
 	renderer := bubbletea.MakeRenderer(s)
-	txtStyle := renderer.NewStyle().Foreground(lipgloss.Color("10"))
+
+	senderStyle := renderer.NewStyle().Foreground(lipgloss.Color("5"))
+	textStyle := renderer.NewStyle().Foreground(lipgloss.Color("10"))
 	quitStyle := renderer.NewStyle().Foreground(lipgloss.Color("8"))
 
-	bg := "light"
-	if renderer.HasDarkBackground() {
-		bg = "dark"
-	}
+	ta := textarea.New()
+	ta.Placeholder = "Send a message..."
+	ta.Focus()
+	ta.Prompt = "┃ "
+	ta.CharLimit = 280
+	ta.SetWidth(pty.Window.Width - 2)
+	ta.SetHeight(3)
+	ta.FocusedStyle.CursorLine = lipgloss.NewStyle()
+	ta.ShowLineNumbers = false
+
+	vp := viewport.New(pty.Window.Width, pty.Window.Height-5)
+
+	existingMessages := getMessages()
 
 	m := model{
-		term:      pty.Term,
-		profile:   renderer.ColorProfile().Name(),
-		width:     pty.Window.Width,
-		height:    pty.Window.Height,
-		bg:        bg,
-		txtStyle:  txtStyle,
-		quitStyle: quitStyle,
+		session:     s,
+		viewport:    vp,
+		textarea:    ta,
+		senderStyle: senderStyle,
+		textStyle:   textStyle,
+		quitStyle:   quitStyle,
+		term:        pty.Term,
+		width:       pty.Window.Width,
+		height:      pty.Window.Height,
 	}
+
+	m.viewport.SetContent(m.formatMessages(existingMessages))
+	m.viewport.GotoBottom()
+
 	return m, []tea.ProgramOption{tea.WithAltScreen()}
 }
 
-// Just a generic tea.Model to demo terminal information of ssh.
 type model struct {
-	term      string
-	profile   string
-	width     int
-	height    int
-	bg        string
-	txtStyle  lipgloss.Style
-	quitStyle lipgloss.Style
+	session          ssh.Session
+	viewport         viewport.Model
+	textarea         textarea.Model
+	senderStyle      lipgloss.Style
+	textStyle        lipgloss.Style
+	quitStyle        lipgloss.Style
+	term             string
+	width            int
+	height           int
+	err              error
+	lastMessageCount int
 }
 
 func (m model) Init() tea.Cmd {
-	return nil
+	return tea.Batch(
+		textarea.Blink,
+		m.checkNewMessages,
+	)
 }
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	var (
+		tiCmd tea.Cmd
+		vpCmd tea.Cmd
+	)
+
+	m.textarea, tiCmd = m.textarea.Update(msg)
+	m.viewport, vpCmd = m.viewport.Update(msg)
+
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		m.height = msg.Height
 		m.width = msg.Width
+		m.textarea.SetWidth(msg.Width - 2)
+		m.viewport.Width = msg.Width
+		m.viewport.Height = msg.Height - 5
+
 	case tea.KeyMsg:
-		switch msg.String() {
-		case "q", "ctrl+c":
+		switch msg.Type {
+		case tea.KeyCtrlC, tea.KeyEsc:
 			return m, tea.Quit
+
+		case tea.KeyEnter:
+			if m.textarea.Value() != "" {
+				message := m.senderStyle.Render(m.session.User()+": ") + m.textarea.Value()
+				addMessage(message)
+
+				updatedMessages := getMessages()
+				m.viewport.SetContent(m.formatMessages(updatedMessages))
+				m.textarea.Reset()
+				m.viewport.GotoBottom()
+			}
 		}
+
+	case messagesUpdatedMsg:
+		updatedMessages := getMessages()
+		if len(updatedMessages) != m.lastMessageCount {
+			m.viewport.SetContent(m.formatMessages(updatedMessages))
+			m.viewport.GotoBottom()
+			m.lastMessageCount = len(updatedMessages)
+		}
+
+	case error:
+		m.err = msg
+		return m, nil
 	}
-	return m, nil
+
+	return m, tea.Batch(
+		tiCmd,
+		vpCmd,
+		m.checkNewMessages,
+	)
+}
+
+type messagesUpdatedMsg struct{}
+
+func (m model) checkNewMessages() tea.Msg {
+	time.Sleep(refreshInterval)
+	return messagesUpdatedMsg{}
+}
+
+func (m model) formatMessages(messages []string) string {
+	return lipgloss.JoinVertical(lipgloss.Left, messages...)
 }
 
 func (m model) View() string {
-	s := fmt.Sprintf("Your term is %s\nYour window size is %dx%d\nBackground: %s\nColor Profile: %s", m.term, m.width, m.height, m.bg, m.profile)
-	return m.txtStyle.Render(s) + "\n\n" + m.quitStyle.Render("Press 'q' to quit\n")
+	chatView := fmt.Sprintf(
+		"%s\n%s",
+		m.viewport.View(),
+		m.textarea.View(),
+	)
+
+	termInfo := m.textStyle.Render(fmt.Sprintf(
+		"Connected as: %s | Term: %s | Window: %dx%d",
+		m.session.User(), m.term, m.width, m.height,
+	))
+
+	quitInfo := m.quitStyle.Render("Press 'Esc' or 'Ctrl+C' to quit")
+
+	return chatView + "\n" + termInfo + "\n" + quitInfo
 }
