@@ -7,6 +7,7 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -61,7 +62,7 @@ func main() {
 		return
 	}
 
-	addMessage("Welcome to the SSH Chat Room!")
+	addMessage("Welcome to the sigmaest Chat Room!")
 
 	done := make(chan os.Signal, 1)
 	signal.Notify(done, os.Interrupt, syscall.SIGINT, syscall.SIGTERM)
@@ -207,7 +208,8 @@ func (m model) checkNewMessages() tea.Msg {
 }
 
 func (m model) formatMessages(messages []string) string {
-	return lipgloss.JoinVertical(lipgloss.Left, messages...)
+
+	return strings.Join(messages, "\n")
 }
 
 func (m model) View() string {
