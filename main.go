@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"net"
@@ -33,12 +34,45 @@ const (
 var (
 	chatMessages = make([]string, 0)
 	chatMutex    = &sync.RWMutex{}
+
+	userNameStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("39")).Bold(true)
+	timestampStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("240")).Italic(true)
+	pubKeyStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("166"))
+	messageStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("252"))
+	messageBoxStyle = lipgloss.NewStyle().
+			Border(lipgloss.RoundedBorder()).
+			BorderForeground(lipgloss.Color("240")).
+			Padding(0, 1).
+			Margin(0, 0, 1, 0)
 )
 
-func addMessage(message string) {
+func addMessage(session ssh.Session, message string) {
 	chatMutex.Lock()
 	defer chatMutex.Unlock()
-	chatMessages = append(chatMessages, message)
+
+	timestamp := time.Now().Format("2006-01-02 15:04:05")
+	pubKey := "N/A"
+	username := "Anonymous"
+
+	if session != nil {
+		username = session.User()
+		fmt.Println(session.PublicKey())
+		if key := session.PublicKey(); key != nil {
+			pubKey = fmt.Sprintf("%x", sha256.Sum256(key.Marshal()))
+		}
+	}
+
+	// Styled message formatting
+	formattedMessage := messageBoxStyle.Render(
+		fmt.Sprintf("%s %s %s\n%s",
+			userNameStyle.Render(username),
+			timestampStyle.Render(timestamp),
+			pubKeyStyle.Render("("+pubKey+")"),
+			messageStyle.Render(message),
+		),
+	)
+
+	chatMessages = append(chatMessages, formattedMessage)
 }
 
 func getMessages() []string {
@@ -62,7 +96,7 @@ func main() {
 		return
 	}
 
-	addMessage("Welcome to the sigmaest Chat Room!")
+	addMessage(nil, "Welcome to the sigmaest Chat Room!")
 
 	done := make(chan os.Signal, 1)
 	signal.Notify(done, os.Interrupt, syscall.SIGINT, syscall.SIGTERM)
@@ -170,8 +204,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		case tea.KeyEnter:
 			if m.textarea.Value() != "" {
-				message := m.senderStyle.Render(m.session.User()+": ") + m.textarea.Value()
-				addMessage(message)
+				addMessage(m.session, m.textarea.Value())
 
 				updatedMessages := getMessages()
 				m.viewport.SetContent(m.formatMessages(updatedMessages))
@@ -208,7 +241,6 @@ func (m model) checkNewMessages() tea.Msg {
 }
 
 func (m model) formatMessages(messages []string) string {
-
 	return strings.Join(messages, "\n")
 }
 
