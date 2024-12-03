@@ -34,17 +34,44 @@ const (
 var (
 	chatMessages = make([]string, 0)
 	chatMutex    = &sync.RWMutex{}
+	usersMutex   = &sync.Mutex{}
+	onlineUsers  = 0
 
-	userNameStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("39")).Bold(true)
-	timestampStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("240")).Italic(true)
-	pubKeyStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("166"))
-	messageStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("252"))
+	// Catppuccin Mocha color palette yay
+	base     = lipgloss.Color("#1E1E2E")
+	text     = lipgloss.Color("#CDD6F4")
+	subtext0 = lipgloss.Color("#A6ADC8")
+	blue     = lipgloss.Color("#89B4FA")
+	green    = lipgloss.Color("#A6E3A1")
+	lavender = lipgloss.Color("#B4BEFE")
+	peach    = lipgloss.Color("#FAB387")
+
+	userNameStyle   = lipgloss.NewStyle().Foreground(blue).Bold(true)
+	timestampStyle  = lipgloss.NewStyle().Foreground(subtext0).Italic(true)
+	pubKeyStyle     = lipgloss.NewStyle().Foreground(peach)
+	messageStyle    = lipgloss.NewStyle().Foreground(text)
 	messageBoxStyle = lipgloss.NewStyle().
 			Border(lipgloss.RoundedBorder()).
-			BorderForeground(lipgloss.Color("240")).
+			BorderForeground(subtext0).
 			Padding(0, 1).
 			Margin(0, 0, 1, 0)
 )
+
+func incrementUsers() {
+	fmt.Println("incrementing users")
+	usersMutex.Lock()
+	defer usersMutex.Unlock()
+	onlineUsers++
+}
+
+func decrementUsers() {
+	fmt.Println("decrementing users")
+	usersMutex.Lock()
+	defer usersMutex.Unlock()
+	if onlineUsers > 0 {
+		onlineUsers--
+	}
+}
 
 func addMessage(session ssh.Session, message string) {
 	chatMutex.Lock()
@@ -56,13 +83,12 @@ func addMessage(session ssh.Session, message string) {
 
 	if session != nil {
 		username = session.User()
-		fmt.Println(session.PublicKey())
+		// this does not work for some reason
 		if key := session.PublicKey(); key != nil {
 			pubKey = fmt.Sprintf("%x", sha256.Sum256(key.Marshal()))
 		}
 	}
 
-	// Styled message formatting
 	formattedMessage := messageBoxStyle.Render(
 		fmt.Sprintf("%s %s %s\n%s",
 			userNameStyle.Render(username),
@@ -96,7 +122,7 @@ func main() {
 		return
 	}
 
-	addMessage(nil, "Welcome to the sigmaest Chat Room!")
+	addMessage(nil, "Welcome to letsgosky.social")
 
 	done := make(chan os.Signal, 1)
 	signal.Notify(done, os.Interrupt, syscall.SIGINT, syscall.SIGTERM)
@@ -114,18 +140,20 @@ func main() {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer func() { cancel() }()
 	if err := s.Shutdown(ctx); err != nil && !errors.Is(err, ssh.ErrServerClosed) {
-		log.Error("Could not stop server", "error", err)
+		log.Error("Could not stop server somehow", "error", err)
 	}
 }
 
 func teaHandler(s ssh.Session) (tea.Model, []tea.ProgramOption) {
+	incrementUsers()
+
 	pty, _, _ := s.Pty()
 
 	renderer := bubbletea.MakeRenderer(s)
 
-	senderStyle := renderer.NewStyle().Foreground(lipgloss.Color("5"))
-	textStyle := renderer.NewStyle().Foreground(lipgloss.Color("10"))
-	quitStyle := renderer.NewStyle().Foreground(lipgloss.Color("8"))
+	senderStyle := renderer.NewStyle().Foreground(lavender)
+	textStyle := renderer.NewStyle().Foreground(green)
+	quitStyle := renderer.NewStyle().Foreground(subtext0)
 
 	ta := textarea.New()
 	ta.Placeholder = "Send a message..."
@@ -200,6 +228,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.KeyMsg:
 		switch msg.Type {
 		case tea.KeyCtrlC, tea.KeyEsc:
+			decrementUsers()
 			return m, tea.Quit
 
 		case tea.KeyEnter:
@@ -252,8 +281,8 @@ func (m model) View() string {
 	)
 
 	termInfo := m.textStyle.Render(fmt.Sprintf(
-		"Connected as: %s | Term: %s | Window: %dx%d",
-		m.session.User(), m.term, m.width, m.height,
+		"Connected as: %s | Term: %s | Window: %dx%d | Online users: %d",
+		m.session.User(), m.term, m.width, m.height, onlineUsers,
 	))
 
 	quitInfo := m.quitStyle.Render("Press 'Esc' or 'Ctrl+C' to quit")
