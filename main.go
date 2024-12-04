@@ -31,13 +31,25 @@ const (
 	refreshInterval = 1 * time.Second
 )
 
+type Message struct {
+	Username  string
+	Timestamp string
+	PubKey    string
+	Content   string
+	Upvotes   int
+	Downvotes int
+	UniqueID  string
+}
+
 var (
-	chatMessages = make([]string, 0)
+	chatMessages = make([]Message, 0)
 	chatMutex    = &sync.RWMutex{}
 	usersMutex   = &sync.Mutex{}
 	onlineUsers  = 0
+	userVotes    = make(map[string]map[string]int)
+	voteMutex    = &sync.Mutex{}
 
-	// Catppuccin Mocha color palette yay
+	// Catppuccin Mocha color palette
 	base     = lipgloss.Color("#1E1E2E")
 	text     = lipgloss.Color("#CDD6F4")
 	subtext0 = lipgloss.Color("#A6ADC8")
@@ -45,11 +57,15 @@ var (
 	green    = lipgloss.Color("#A6E3A1")
 	lavender = lipgloss.Color("#B4BEFE")
 	peach    = lipgloss.Color("#FAB387")
+	red      = lipgloss.Color("#F38BA8")
+	selected = lipgloss.Color("#45475A")
 
 	userNameStyle   = lipgloss.NewStyle().Foreground(blue).Bold(true)
 	timestampStyle  = lipgloss.NewStyle().Foreground(subtext0).Italic(true)
 	pubKeyStyle     = lipgloss.NewStyle().Foreground(peach)
 	messageStyle    = lipgloss.NewStyle().Foreground(text)
+	upvoteStyle     = lipgloss.NewStyle().Foreground(green)
+	downvoteStyle   = lipgloss.NewStyle().Foreground(red)
 	messageBoxStyle = lipgloss.NewStyle().
 			Border(lipgloss.RoundedBorder()).
 			BorderForeground(subtext0).
@@ -73,6 +89,58 @@ func decrementUsers() {
 	}
 }
 
+func generateUniqueMessageID(msg Message) string {
+	hash := sha256.New()
+	hash.Write([]byte(fmt.Sprintf("%s%s%s", msg.Username, msg.Timestamp, msg.Content)))
+	return fmt.Sprintf("%x", hash.Sum(nil))
+}
+
+func voteMessage(session ssh.Session, messageID string, voteType int) error {
+	voteMutex.Lock()
+	defer voteMutex.Unlock()
+
+	username := session.User()
+	userVotesForMessage, exists := userVotes[username]
+	if !exists {
+		userVotes[username] = make(map[string]int)
+		userVotesForMessage = userVotes[username]
+	}
+
+	// Check if user has already voted this way
+	if userVotesForMessage[messageID] == voteType {
+		return errors.New("you have already voted this way")
+	}
+
+	chatMutex.Lock()
+	defer chatMutex.Unlock()
+
+	for i, msg := range chatMessages {
+		if msg.UniqueID == messageID {
+			// Remove previous vote if exists
+			if prevVote, exists := userVotesForMessage[messageID]; exists {
+				if prevVote > 0 {
+					chatMessages[i].Upvotes--
+				} else if prevVote < 0 {
+					chatMessages[i].Downvotes--
+				}
+			}
+
+			// Add new vote
+			if voteType > 0 {
+				chatMessages[i].Upvotes++
+			} else {
+				chatMessages[i].Downvotes++
+			}
+
+			// Update user's vote
+			userVotesForMessage[messageID] = voteType
+			return nil
+		}
+	}
+
+	return errors.New("message not found")
+}
+
 func addMessage(session ssh.Session, message string) {
 	chatMutex.Lock()
 	defer chatMutex.Unlock()
@@ -83,28 +151,28 @@ func addMessage(session ssh.Session, message string) {
 
 	if session != nil {
 		username = session.User()
-		// this does not work for some reason
 		if key := session.PublicKey(); key != nil {
 			pubKey = fmt.Sprintf("%x", sha256.Sum256(key.Marshal()))
 		}
 	}
 
-	formattedMessage := messageBoxStyle.Render(
-		fmt.Sprintf("%s %s %s\n%s",
-			userNameStyle.Render(username),
-			timestampStyle.Render(timestamp),
-			pubKeyStyle.Render("("+pubKey+")"),
-			messageStyle.Render(message),
-		),
-	)
+	msg := Message{
+		Username:  username,
+		Timestamp: timestamp,
+		PubKey:    pubKey,
+		Content:   message,
+		Upvotes:   0,
+		Downvotes: 0,
+	}
+	msg.UniqueID = generateUniqueMessageID(msg)
 
-	chatMessages = append(chatMessages, formattedMessage)
+	chatMessages = append(chatMessages, msg)
 }
 
-func getMessages() []string {
+func getMessages() []Message {
 	chatMutex.RLock()
 	defer chatMutex.RUnlock()
-	return append([]string(nil), chatMessages...)
+	return append([]Message(nil), chatMessages...)
 }
 
 func main() {
@@ -199,6 +267,8 @@ type model struct {
 	height           int
 	err              error
 	lastMessageCount int
+	selectedMessage  int
+	isSelectMode     bool
 }
 
 func (m model) Init() tea.Cmd {
@@ -208,13 +278,22 @@ func (m model) Init() tea.Cmd {
 	)
 }
 
+type messagesUpdatedMsg struct{}
+
+func (m model) checkNewMessages() tea.Msg {
+	time.Sleep(refreshInterval)
+	return messagesUpdatedMsg{}
+}
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	var (
 		tiCmd tea.Cmd
 		vpCmd tea.Cmd
 	)
 
-	m.textarea, tiCmd = m.textarea.Update(msg)
+	// Handle different input modes
+	if !m.isSelectMode {
+		m.textarea, tiCmd = m.textarea.Update(msg)
+	}
 	m.viewport, vpCmd = m.viewport.Update(msg)
 
 	switch msg := msg.(type) {
@@ -231,14 +310,68 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			decrementUsers()
 			return m, tea.Quit
 
+		case tea.KeyTab:
+			// Toggle between input and selection modes
+			m.isSelectMode = !m.isSelectMode
+			if m.isSelectMode {
+				m.textarea.Blur()
+				// Initialize selected message to the last message
+				m.selectedMessage = len(chatMessages) - 1
+			} else {
+				m.textarea.Focus()
+			}
+
 		case tea.KeyEnter:
-			if m.textarea.Value() != "" {
+			if !m.isSelectMode && m.textarea.Value() != "" {
 				addMessage(m.session, m.textarea.Value())
 
 				updatedMessages := getMessages()
 				m.viewport.SetContent(m.formatMessages(updatedMessages))
 				m.textarea.Reset()
 				m.viewport.GotoBottom()
+			}
+
+		default:
+			if m.isSelectMode {
+				switch msg.Type {
+				case tea.KeyUp:
+					if m.selectedMessage > 0 {
+						m.selectedMessage--
+						m.viewport.SetContent(m.formatMessages(getMessages()))
+					}
+				case tea.KeyDown:
+					if m.selectedMessage < len(chatMessages)-1 {
+						m.selectedMessage++
+						m.viewport.SetContent(m.formatMessages(getMessages()))
+					}
+
+				case tea.KeyRunes:
+					switch msg.String() {
+					case "u", "U":
+						if len(chatMessages) > m.selectedMessage {
+							selectedMsg := chatMessages[m.selectedMessage]
+							err := voteMessage(m.session, selectedMsg.UniqueID, 1)
+							if err != nil {
+								m.err = err
+							} else {
+								updatedMessages := getMessages()
+								m.viewport.SetContent(m.formatMessages(updatedMessages))
+							}
+						}
+
+					case "d", "D":
+						if len(chatMessages) > m.selectedMessage {
+							selectedMsg := chatMessages[m.selectedMessage]
+							err := voteMessage(m.session, selectedMsg.UniqueID, -1)
+							if err != nil {
+								m.err = err
+							} else {
+								updatedMessages := getMessages()
+								m.viewport.SetContent(m.formatMessages(updatedMessages))
+							}
+						}
+					}
+				}
 			}
 		}
 
@@ -248,6 +381,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.viewport.SetContent(m.formatMessages(updatedMessages))
 			m.viewport.GotoBottom()
 			m.lastMessageCount = len(updatedMessages)
+
+			m.selectedMessage = len(updatedMessages) - 1
 		}
 
 	case error:
@@ -262,17 +397,44 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	)
 }
 
-type messagesUpdatedMsg struct{}
+func (m model) formatMessages(messages []Message) string {
+	var formattedMessages []string
+	for i, msg := range messages {
+		var messageStyle lipgloss.Style
+		var boxStyle lipgloss.Style
 
-func (m model) checkNewMessages() tea.Msg {
-	time.Sleep(refreshInterval)
-	return messagesUpdatedMsg{}
+		if m.isSelectMode && i == m.selectedMessage {
+			boxStyle = lipgloss.NewStyle().
+				Border(lipgloss.RoundedBorder()).
+				BorderForeground(red).
+				Padding(0, 1).
+				Margin(0, 0, 1, 0)
+
+			messageStyle = lipgloss.NewStyle().
+				Background(selected).
+				Foreground(text).
+				Padding(0, 1)
+		} else {
+			boxStyle = messageBoxStyle
+			messageStyle = lipgloss.NewStyle().
+				Foreground(text)
+		}
+
+		header := fmt.Sprintf("%s %s %s | %s %s",
+			userNameStyle.Render(msg.Username),
+			timestampStyle.Render(msg.Timestamp),
+			pubKeyStyle.Render("("+msg.PubKey+")"),
+			upvoteStyle.Render(fmt.Sprintf("👍 %d", msg.Upvotes)),
+			downvoteStyle.Render(fmt.Sprintf("👎 %d", msg.Downvotes)),
+		)
+
+		formattedMessage := boxStyle.Render(
+			header + "\n" + messageStyle.Render(msg.Content),
+		)
+		formattedMessages = append(formattedMessages, formattedMessage)
+	}
+	return strings.Join(formattedMessages, "\n")
 }
-
-func (m model) formatMessages(messages []string) string {
-	return strings.Join(messages, "\n")
-}
-
 func (m model) View() string {
 	chatView := fmt.Sprintf(
 		"%s\n%s",
@@ -285,7 +447,16 @@ func (m model) View() string {
 		m.session.User(), m.term, m.width, m.height, onlineUsers,
 	))
 
-	quitInfo := m.quitStyle.Render("Press 'Esc' or 'Ctrl+C' to quit")
+	var modeInfo string
+	if m.isSelectMode {
+		modeInfo = m.quitStyle.Render(
+			"SELECTION MODE: ↑/↓ to navigate | 'u' to upvote | 'd' to downvote | TAB to exit",
+		)
+	} else {
+		modeInfo = m.quitStyle.Render(
+			"INPUT MODE: Type message | TAB to select messages | 'Esc' or 'Ctrl+C' to quit",
+		)
+	}
 
-	return chatView + "\n" + termInfo + "\n" + quitInfo
+	return chatView + "\n" + termInfo + "\n" + modeInfo
 }
