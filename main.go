@@ -39,6 +39,7 @@ type Message struct {
 	Upvotes   int
 	Downvotes int
 	UniqueID  string
+	System    bool
 }
 
 var (
@@ -141,7 +142,7 @@ func voteMessage(session ssh.Session, messageID string, voteType int) error {
 	return errors.New("message not found")
 }
 
-func addMessage(session ssh.Session, message string) {
+func addMessage(session ssh.Session, message string, system bool) {
 	chatMutex.Lock()
 	defer chatMutex.Unlock()
 
@@ -163,8 +164,12 @@ func addMessage(session ssh.Session, message string) {
 		Content:   message,
 		Upvotes:   0,
 		Downvotes: 0,
+		System:    system,
 	}
-	msg.UniqueID = generateUniqueMessageID(msg)
+
+	if !system {
+		msg.UniqueID = generateUniqueMessageID(msg)
+	}
 
 	chatMessages = append(chatMessages, msg)
 }
@@ -190,7 +195,7 @@ func main() {
 		return
 	}
 
-	addMessage(nil, "Welcome to letsgosky.social")
+	addMessage(nil, "Welcome to letsgosky.social", true)
 
 	done := make(chan os.Signal, 1)
 	signal.Notify(done, os.Interrupt, syscall.SIGINT, syscall.SIGTERM)
@@ -213,6 +218,8 @@ func main() {
 }
 
 func teaHandler(s ssh.Session) (tea.Model, []tea.ProgramOption) {
+	addMessage(nil, fmt.Sprintf("Silly goober %s has made the mistake of joining the cult", s.User()), true)
+
 	incrementUsers()
 
 	pty, _, _ := s.Pty()
@@ -323,7 +330,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		case tea.KeyEnter:
 			if !m.isSelectMode && m.textarea.Value() != "" {
-				addMessage(m.session, m.textarea.Value())
+				addMessage(m.session, m.textarea.Value(), false)
 
 				updatedMessages := getMessages()
 				m.viewport.SetContent(m.formatMessages(updatedMessages))
@@ -335,15 +342,26 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.isSelectMode {
 				switch msg.Type {
 				case tea.KeyUp:
-					if m.selectedMessage > 0 {
-						m.selectedMessage--
-						m.viewport.SetContent(m.formatMessages(getMessages()))
+					for {
+						if m.selectedMessage > 0 {
+							m.selectedMessage--
+						}
+						if m.selectedMessage == 0 || !chatMessages[m.selectedMessage].System {
+							break
+						}
 					}
+					m.viewport.SetContent(m.formatMessages(getMessages()))
+
 				case tea.KeyDown:
-					if m.selectedMessage < len(chatMessages)-1 {
-						m.selectedMessage++
-						m.viewport.SetContent(m.formatMessages(getMessages()))
+					for {
+						if m.selectedMessage < len(chatMessages)-1 {
+							m.selectedMessage++
+						}
+						if m.selectedMessage == len(chatMessages)-1 || !chatMessages[m.selectedMessage].System {
+							break
+						}
 					}
+					m.viewport.SetContent(m.formatMessages(getMessages()))
 
 				case tea.KeyRunes:
 					switch msg.String() {
@@ -396,12 +414,22 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.checkNewMessages,
 	)
 }
-
 func (m model) formatMessages(messages []Message) string {
 	var formattedMessages []string
 	for i, msg := range messages {
+		if m.isSelectMode && msg.System {
+			continue // Skip system messages in selection mode
+		}
+
 		var messageStyle lipgloss.Style
 		var boxStyle lipgloss.Style
+
+		if msg.System {
+			// Style for system messages
+			messageStyle = lipgloss.NewStyle().Foreground(subtext0).Italic(true)
+			formattedMessages = append(formattedMessages, messageStyle.Render(msg.Content))
+			continue
+		}
 
 		if m.isSelectMode && i == m.selectedMessage {
 			boxStyle = lipgloss.NewStyle().
@@ -435,6 +463,7 @@ func (m model) formatMessages(messages []Message) string {
 	}
 	return strings.Join(formattedMessages, "\n")
 }
+
 func (m model) View() string {
 	chatView := fmt.Sprintf(
 		"%s\n%s",
